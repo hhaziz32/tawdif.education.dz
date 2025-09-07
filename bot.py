@@ -8,25 +8,30 @@ from telegram.ext import Application, CommandHandler, CallbackContext
 import logging
 
 # --- الإعدادات الأساسية ---
-# سيتم قراءة هذه المتغيرات من إعدادات سيرفر Render
 TOKEN = os.environ.get("TELEGRAM_TOKEN")
 PORT = int(os.environ.get('PORT', 8443))
-APP_NAME = os.environ.get("APP_NAME") # e.g., your-app-name.onrender.com
+APP_NAME = os.environ.get("APP_NAME")
 
-# إعداد تسجيل الدخول لتتبع الأخطاء
 logging.basicConfig(format='%(asctime)s - %(name)s - %(levelname)s - %(message)s', level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# --- دالة جديدة لتهريب الحروف الخاصة ---
+def escape_markdown_v2(text: str) -> str:
+    """تهريب الحروف الخاصة لتنسيق MarkdownV2 في تليجرام."""
+    escape_chars = r'_*[]()~`>#+-=|{}.!'
+    return re.sub(f'([{re.escape(escape_chars)}])', r'\\\1', text)
+
 # -----------------------------------------------------------------------------
-# الجزء الأساسي: دالة فحص الحساب (لا تغيير هنا)
+# دالة فحص الحساب (تم إضافة timeout)
 # -----------------------------------------------------------------------------
 def check_account(username, password):
     payload = {'user': username, 'password': password}
     headers = {'User-Agent': 'Mozilla/5.0'}
     try:
         with requests.Session() as session:
-            session.post('https://tawdif.education.dz/login', data=payload, headers=headers).raise_for_status()
-            response = session.get('https://tawdif.education.dz/results', headers=headers)
+            # تم إضافة timeout=20 لمنع التعليق
+            session.post('https://tawdif.education.dz/login', data=payload, headers=headers, timeout=20).raise_for_status()
+            response = session.get('https://tawdif.education.dz/results', headers=headers, timeout=20)
             response.raise_for_status()
             soup = BeautifulSoup(response.content, 'html.parser')
             info_card_header = soup.find('h4', class_='text-white card-title', string=re.compile("معلومات المترشح"))
@@ -41,15 +46,17 @@ def check_account(username, password):
                 "subject": get_info_by_label("المادة"), "status_text": soup.find('h1', class_='card-title').text.strip()
             }
             return {"status": "success", "data": data}
+    except requests.exceptions.Timeout:
+        logger.error(f"Timeout error for {username}")
+        return {"status": "failed", "message": "انتهت مهلة الاتصال بالموقع. (قد يكون الموقع بطيئًا أو يحظر السيرفر)"}
     except requests.exceptions.RequestException as e:
         logger.error(f"Network error for {username}: {e}")
-        return {"status": "failed", "message": "حدث خطأ في الشبكة."}
+        return {"status": "failed", "message": "حدث خطأ عام في الشبكة."}
 
 # -----------------------------------------------------------------------------
-# دوال الأوامر الخاصة بالبوت (تم تحديثها لتكون async)
+# دوال الأوامر الخاصة بالبوت
 # -----------------------------------------------------------------------------
 async def start(update: Update, context: CallbackContext) -> None:
-    """إرسال رسالة ترحيب عند إرسال الأمر /start."""
     welcome_message = (
         "👋 *أهلاً بك في بوت فحص النتائج*\n\n"
         "يمكنك استخدام هذا البوت لفحص حالة ملفك بسهولة\\.\n\n"
@@ -59,63 +66,50 @@ async def start(update: Update, context: CallbackContext) -> None:
         "*مثال:*\n"
         "`/check aziz3232:aziz3232`"
     )
-    await update.message.reply_text(welcome_message, parse_mode=ParseMode.MARKDOWN_V2)
+    await update.message.reply_text(escape_markdown_v2(welcome_message), parse_mode=ParseMode.MARKDOWN_V2)
 
 async def check_single_account(update: Update, context: CallbackContext) -> None:
-    """فحص حساب واحد يتم إرساله مع الأمر."""
     try:
         credentials = context.args[0]
         username, password = credentials.split(':', 1)
         
         # إرسال رسالة "جاري الفحص..."
-        sent_message = await update.message.reply_text(f"⏳ جارٍ فحص الحساب: `{username}`\nالرجاء الانتظار قليلاً\\.\\.\\.")
+        progress_message = f"⏳ جارٍ فحص الحساب: `{username}`\nالرجاء الانتظار قليلاً..."
+        sent_message = await update.message.reply_text(escape_markdown_v2(progress_message), parse_mode=ParseMode.MARKDOWN_V2)
         
-        # استدعاء دالة الفحص
         result = check_account(username, password)
         
-        # تنسيق الرسالة النهائية
         if result["status"] == "success":
             data = result["data"]
-            status_text = data['status_text']
-            
-            emoji = "❓"
+            status_text = data['status_text']; emoji = "❓"
             if "جاري دراسة" in status_text: emoji = "⏳"
             elif "مطابق" in status_text or "مقبول" in status_text: emoji = "✅"
             elif "مرفوض" in status_text: emoji = "❌"
-
-            # يجب تهريب الأحرف الخاصة في MarkdownV2
             message = (
                 f"✅ *نتائج الحساب: `{username}`*\n\n"
                 f"*الاسم الكامل:* {data['first_name']} {data['last_name']}\n"
                 f"*الإقامة:* {data['residence']}\n"
-                f"*المنصب:* {data['position']} \\({data['subject']}\\)\n\n"
+                f"*المنصب:* {data['position']} ({data['subject']})\n\n"
                 f"*{emoji} الحالة:* {status_text}"
             )
         else:
             message = f"❌ *فشل فحص الحساب: `{username}`*\n\n*السبب:* {result['message']}"
 
-        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=sent_message.message_id, text=message, parse_mode=ParseMode.MARKDOWN_V2)
+        await context.bot.edit_message_text(chat_id=update.effective_chat.id, message_id=sent_message.message_id, text=escape_markdown_v2(message), parse_mode=ParseMode.MARKDOWN_V2)
 
     except (IndexError, ValueError):
         await update.message.reply_text(
-            "⚠️ *خطأ في الصيغة*\n\n"
-            "الرجاء إرسال الأمر بالتنسيق الصحيح:\n"
-            "`/check username:password`",
+            escape_markdown_v2("⚠️ *خطأ في الصيغة*\n\nالرجاء إرسال الأمر بالتنسيق الصحيح:\n`/check username:password`"),
             parse_mode=ParseMode.MARKDOWN_V2
         )
 
 # -----------------------------------------------------------------------------
-# دالة التشغيل الرئيسية (محدثة بالكامل لـ v20+)
+# دالة التشغيل الرئيسية
 # -----------------------------------------------------------------------------
 def main() -> None:
-    """إنشاء وتشغيل البوت."""
     application = Application.builder().token(TOKEN).build()
-
-    # تسجيل الأوامر
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("check", check_single_account))
-
-    # تشغيل البوت باستخدام Webhook (الطريقة الموصى بها للسيرفرات)
     application.run_webhook(
         listen="0.0.0.0",
         port=PORT,
