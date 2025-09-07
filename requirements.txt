@@ -2,5 +2,4 @@ python-telegram-bot
 requests
 beautifulsoup4
 arabic_reshaper
-python-bidi
-Flask
+python-bid
